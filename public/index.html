@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RFP Evaluation Tool</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>RFP Evaluation Tool</h1>
+            <p class="subtitle">Evaluate RFP responses against custom rubrics using AI</p>
+        </header>
+
+        <main>
+            <form id="evaluationForm">
+                <div id="sectionsContainer" class="sections-container">
+                    <!-- Sections will be dynamically added here -->
+                </div>
+
+                <div class="button-group-top">
+                    <button type="button" id="addSectionBtn" class="add-section-btn">
+                        + Add Section
+                    </button>
+                </div>
+
+                <div class="button-group">
+                    <button type="submit" id="submitBtn" class="submit-btn">
+                        <span class="btn-text">Evaluate All Sections</span>
+                        <span class="btn-loader" style="display: none;">
+                            <span class="spinner"></span>
+                            <span id="progressText">Evaluating...</span>
+                        </span>
+                    </button>
+                    <button type="button" id="stopBtn" class="stop-btn" style="display: none;">
+                        Stop Evaluating
+                    </button>
+                </div>
+            </form>
+
+            <div id="errorMessage" class="error-message" style="display: none;"></div>
+
+            <div id="results" class="results" style="display: none;">
+                <h2>Evaluation Results</h2>
+                <div id="resultsContent" class="results-content"></div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const form = document.getElementById('evaluationForm');
+        const sectionsContainer = document.getElementById('sectionsContainer');
+        const addSectionBtn = document.getElementById('addSectionBtn');
+        const submitBtn = document.getElementById('submitBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const btnText = submitBtn.querySelector('.btn-text');
+        const btnLoader = submitBtn.querySelector('.btn-loader');
+        const progressText = document.getElementById('progressText');
+        const results = document.getElementById('results');
+        const resultsContent = document.getElementById('resultsContent');
+        const errorMessage = document.getElementById('errorMessage');
+        
+        let sectionCount = 0;
+        let isEvaluating = false;
+        let shouldStop = false;
+        let currentControllers = [];
+
+        // Initialize with one section
+        addSection();
+
+        // Add section button handler
+        addSectionBtn.addEventListener('click', () => {
+            addSection();
+        });
+
+        // Stop button handler
+        stopBtn.addEventListener('click', () => {
+            shouldStop = true;
+            // Abort all pending requests
+            currentControllers.forEach(controller => {
+                if (controller) {
+                    controller.abort();
+                }
+            });
+            currentControllers = [];
+            resetButtonState();
+            errorMessage.textContent = 'Evaluation cancelled by user.';
+            errorMessage.style.display = 'block';
+        });
+
+        function addSection() {
+            sectionCount++;
+            const sectionIndex = sectionCount;
+            
+            const sectionDiv = document.createElement('div');
+            sectionDiv.className = 'section-container';
+            sectionDiv.dataset.sectionIndex = sectionIndex;
+            
+            sectionDiv.innerHTML = `
+                <div class="section-header">
+                    <h3>Section ${sectionIndex}</h3>
+                    <button type="button" class="remove-section-btn" onclick="removeSection(${sectionIndex})" title="Remove this section">×</button>
+                </div>
+                <div class="section-inputs">
+                    <div class="input-group">
+                        <label for="rfp_text_${sectionIndex}">RFP Response Section</label>
+                        <textarea 
+                            id="rfp_text_${sectionIndex}" 
+                            name="rfp_text_${sectionIndex}" 
+                            rows="10" 
+                            placeholder="Paste your RFP response section here..."
+                            required
+                        ></textarea>
+                    </div>
+                    <div class="input-group">
+                        <label for="rubric_${sectionIndex}">Rubric</label>
+                        <textarea 
+                            id="rubric_${sectionIndex}" 
+                            name="rubric_${sectionIndex}" 
+                            rows="10" 
+                            placeholder="Paste your rubric here..."
+                            required
+                        ></textarea>
+                    </div>
+                </div>
+            `;
+            
+            sectionsContainer.appendChild(sectionDiv);
+        }
+
+        // Make removeSection globally accessible
+        window.removeSection = function(sectionIndex) {
+            const sectionDiv = document.querySelector(`[data-section-index="${sectionIndex}"]`);
+            if (sectionDiv) {
+                sectionDiv.remove();
+                // Update section numbers
+                updateSectionNumbers();
+            }
+        };
+
+        function updateSectionNumbers() {
+            const sections = sectionsContainer.querySelectorAll('.section-container');
+            sections.forEach((section, index) => {
+                const header = section.querySelector('.section-header h3');
+                if (header) {
+                    header.textContent = `Section ${index + 1}`;
+                }
+            });
+        }
+
+        function resetButtonState() {
+            isEvaluating = false;
+            shouldStop = false;
+            submitBtn.disabled = false;
+            btnText.style.display = 'inline';
+            btnLoader.style.display = 'none';
+            stopBtn.style.display = 'none';
+            currentControllers = [];
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            if (isEvaluating) {
+                return;
+            }
+            
+            // Hide previous results and errors
+            results.style.display = 'none';
+            errorMessage.style.display = 'none';
+            
+            // Collect all sections
+            const sections = [];
+            const sectionDivs = sectionsContainer.querySelectorAll('.section-container');
+            
+            for (const sectionDiv of sectionDivs) {
+                const sectionIndex = sectionDiv.dataset.sectionIndex;
+                const rfpText = document.getElementById(`rfp_text_${sectionIndex}`).value.trim();
+                const rubric = document.getElementById(`rubric_${sectionIndex}`).value.trim();
+                
+                if (!rfpText || !rubric) {
+                    errorMessage.textContent = `Please fill in both RFP text and rubric for all sections.`;
+                    errorMessage.style.display = 'block';
+                    return;
+                }
+                
+                sections.push({
+                    rfp_text: rfpText,
+                    rubric: rubric
+                });
+            }
+            
+            if (sections.length === 0) {
+                errorMessage.textContent = 'Please add at least one section.';
+                errorMessage.style.display = 'block';
+                return;
+            }
+            
+            // Show loading state
+            isEvaluating = true;
+            submitBtn.disabled = true;
+            btnText.style.display = 'none';
+            btnLoader.style.display = 'inline-flex';
+            stopBtn.style.display = 'block';
+            
+            // Clear previous results
+            resultsContent.innerHTML = '';
+            
+            // Process sections sequentially
+            const allResults = [];
+            
+            try {
+                for (let i = 0; i < sections.length; i++) {
+                    if (shouldStop) {
+                        break;
+                    }
+                    
+                    // Update progress
+                    progressText.textContent = `Evaluating section ${i + 1} of ${sections.length}...`;
+                    
+                    // Create AbortController for this request
+                    const controller = new AbortController();
+                    currentControllers.push(controller);
+                    
+                    const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout
+                    
+                    try {
+                        const response = await fetch('/.netlify/functions/evaluate', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                sections: [sections[i]]
+                            }),
+                            signal: controller.signal
+                        });
+                        
+                        clearTimeout(timeoutId);
+                        
+                        if (shouldStop) {
+                            break;
+                        }
+                        
+                        if (!response.ok) {
+                            let errorMsg = 'An error occurred';
+                            try {
+                                const errorData = await response.json();
+                                errorMsg = errorData.error || errorMsg;
+                            } catch (e) {
+                                errorMsg = `Server error (${response.status}): ${response.statusText}`;
+                            }
+                            allResults.push({
+                                section_index: i,
+                                success: false,
+                                error: errorMsg
+                            });
+                            continue;
+                        }
+                        
+                        const text = await response.text();
+                        if (!text) {
+                            allResults.push({
+                                section_index: i,
+                                success: false,
+                                error: 'Empty response from server'
+                            });
+                            continue;
+                        }
+                        
+                        const data = JSON.parse(text);
+                        
+                        if (data.success && data.results && data.results.length > 0) {
+                            allResults.push(data.results[0]);
+                        } else {
+                            allResults.push({
+                                section_index: i,
+                                success: false,
+                                error: data.error || 'Unknown error'
+                            });
+                        }
+                        
+                        // Display result for this section immediately
+                        displaySectionResult(i + 1, allResults[allResults.length - 1]);
+                        
+                    } catch (error) {
+                        clearTimeout(timeoutId);
+                        
+                        if (error.name === 'AbortError') {
+                            if (shouldStop) {
+                                break;
+                            }
+                            allResults.push({
+                                section_index: i,
+                                success: false,
+                                error: 'Request timed out. The evaluation is taking too long.'
+                            });
+                        } else {
+                            allResults.push({
+                                section_index: i,
+                                success: false,
+                                error: error.message || 'An error occurred while evaluating this section.'
+                            });
+                        }
+                        
+                        // Display error for this section
+                        displaySectionResult(i + 1, allResults[allResults.length - 1]);
+                    }
+                }
+                
+                // Show results container
+                if (allResults.length > 0) {
+                    results.style.display = 'block';
+                    results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+                
+            } catch (error) {
+                errorMessage.textContent = error.message || 'An error occurred while evaluating. Please try again.';
+                errorMessage.style.display = 'block';
+            } finally {
+                resetButtonState();
+            }
+        });
+        
+        function displaySectionResult(sectionNumber, result) {
+            const sectionResultDiv = document.createElement('div');
+            sectionResultDiv.className = 'section-result';
+            sectionResultDiv.innerHTML = `<h3 class="section-result-header">Section ${sectionNumber} Results</h3>`;
+            
+            if (result.success && result.result) {
+                const resultContent = document.createElement('div');
+                resultContent.className = 'section-result-content';
+                resultContent.innerHTML = formatResults(result.result);
+                sectionResultDiv.appendChild(resultContent);
+            } else {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'section-error';
+                errorDiv.textContent = result.error || 'An error occurred while evaluating this section.';
+                sectionResultDiv.appendChild(errorDiv);
+            }
+            
+            resultsContent.appendChild(sectionResultDiv);
+        }
+        
+        function formatResults(text) {
+            const lines = text.split('\n');
+            let html = '';
+            let inTable = false;
+            let tableRows = [];
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                
+                // Check if this is a table row
+                if (line.startsWith('|') && line.endsWith('|') && line.length > 2) {
+                    if (!inTable) {
+                        inTable = true;
+                        tableRows = [];
+                    }
+                    // Parse table row - split by | and filter empty strings
+                    const cells = line.split('|').map(c => c.trim()).filter(c => c);
+                    tableRows.push(cells);
+                } else {
+                    // Not a table row
+                    if (inTable && tableRows.length > 0) {
+                        // Process the accumulated table
+                        html += formatTable(tableRows);
+                        inTable = false;
+                        tableRows = [];
+                    }
+                    
+                    // Process non-table lines
+                    if (line) {
+                        // Skip separator rows (like |---|---|)
+                        if (line.match(/^\|[\s\-:]+\|$/)) {
+                            continue;
+                        }
+                        
+                        // Convert markdown headers
+                        if (line.startsWith('### ')) {
+                            html += `<h3>${line.substring(4)}</h3>`;
+                        } else if (line.startsWith('## ')) {
+                            html += `<h2>${line.substring(3)}</h2>`;
+                        } else if (line.startsWith('# ')) {
+                            html += `<h1>${line.substring(2)}</h1>`;
+                        } else if (line.startsWith('* ')) {
+                            html += `<li>${line.substring(2)}</li>`;
+                        } else {
+                            // Regular paragraph
+                            let processedLine = line;
+                            // Convert bold text
+                            processedLine = processedLine.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+                            html += `<p>${processedLine}</p>`;
+                        }
+                    } else {
+                        html += '<br>';
+                    }
+                }
+            }
+            
+            // Handle table at end of text
+            if (inTable && tableRows.length > 0) {
+                html += formatTable(tableRows);
+            }
+            
+            // Wrap consecutive <li> elements in <ul>
+            html = html.replace(/(<li>.*?<\/li>(?:\s*<li>.*?<\/li>)*)/g, (match) => {
+                return '<ul>' + match + '</ul>';
+            });
+            
+            return html;
+        }
+        
+        function formatTable(rows) {
+            if (rows.length === 0) return '';
+            
+            // Filter out separator rows (rows that are all dashes or colons)
+            const validRows = rows.filter(row => {
+                const rowText = row.join('').toLowerCase();
+                return !rowText.match(/^[\s\-:]+$/);
+            });
+            
+            if (validRows.length === 0) return '';
+            
+            let html = '<table class="results-table"><thead><tr>';
+            // First valid row is header
+            validRows[0].forEach(cell => {
+                const processedCell = cell.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+                html += `<th>${processedCell}</th>`;
+            });
+            html += '</tr></thead><tbody>';
+            
+            // Remaining rows are data
+            for (let i = 1; i < validRows.length; i++) {
+                html += '<tr>';
+                validRows[i].forEach(cell => {
+                    const processedCell = cell.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+                    html += `<td>${processedCell}</td>`;
+                });
+                html += '</tr>';
+            }
+            
+            html += '</tbody></table>';
+            return html;
+        }
+    </script>
+</body>
+</html>
+
