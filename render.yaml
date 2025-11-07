@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: rfp-evaluation-tool
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+    plan: free
+
