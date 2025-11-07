@@ -2,6 +2,9 @@
   publish = "public"
   functions = "netlify/functions"
 
+# SPA fallback - redirect all routes to index.html
+# Note: .netlify paths are automatically handled by Netlify Functions
+# and won't be caught by this redirect
 [[redirects]]
   from = "/*"
   to = "/index.html"
