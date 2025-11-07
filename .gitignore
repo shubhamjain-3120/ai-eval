@@ -10,4 +10,5 @@ ENV/
 .venv
 *.log
 .DS_Store
+netlify/functions/__pycache__/
 
