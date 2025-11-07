@@ -10,7 +10,7 @@ backlog = 2048
 workers = 1  # Use only 1 worker on free tier to save memory
 worker_class = "sync"
 worker_connections = 1000
-timeout = 120  # Increase timeout to 2 minutes for OpenAI API calls
+timeout = 180  # Increase timeout to 3 minutes for OpenAI API calls with queuing
 keepalive = 5
 
 # Logging

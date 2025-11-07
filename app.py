@@ -1,9 +1,12 @@
 import os
 import logging
 import sys
+import threading
+import queue
+import time
 from flask import Flask, render_template, request, jsonify
 from openai import OpenAI
-from openai import AuthenticationError, RateLimitError, APIError
+from openai import AuthenticationError, RateLimitError, APIError, APITimeoutError
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -31,8 +34,18 @@ if not api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
 logger.info("Initializing OpenAI client")
-client = OpenAI(api_key=api_key)
+client = OpenAI(
+    api_key=api_key,
+    timeout=90.0,  # 90 second timeout for API calls
+    max_retries=2  # Retry up to 2 times on failure
+)
 logger.info("OpenAI client initialized successfully")
+
+# Request queue for managing concurrent requests
+request_queue = queue.Queue(maxsize=10)  # Max 10 queued requests
+queue_lock = threading.Lock()
+active_requests = 0
+max_concurrent_requests = 2  # Limit concurrent OpenAI API calls
 
 
 @app.route('/')
@@ -42,47 +55,56 @@ def index():
     return render_template('index.html')
 
 
+def truncate_text(text, max_length=8000):
+    """Truncate text to max_length characters, preserving word boundaries"""
+    if len(text) <= max_length:
+        return text
+    truncated = text[:max_length]
+    # Try to cut at a word boundary
+    last_space = truncated.rfind(' ')
+    if last_space > max_length * 0.9:  # If we can find a space in the last 10%
+        truncated = truncated[:last_space]
+    return truncated + "... [truncated]"
+
+
 def evaluate_single_section(rfp_text, rubric_text):
-    """Helper function to evaluate a single section"""
+    """Helper function to evaluate a single section with optimizations"""
+    # Truncate inputs to prevent excessive token usage
+    rfp_text = truncate_text(rfp_text, max_length=6000)
+    rubric_text = truncate_text(rubric_text, max_length=2000)
+    
     logger.debug(f"Evaluating section - RFP text length: {len(rfp_text)}, Rubric length: {len(rubric_text)}")
     
-    # Construct the prompt
-    prompt = f"""Evaluate the following RFP response section using the rubric below.
+    # Optimized prompt - more concise
+    prompt = f"""Evaluate this RFP response section using the rubric.
 
----
-
-**RFP Response Section:**
-
-```
+RFP Response:
 {rfp_text}
-```
 
-**Rubric:**
-
+Rubric:
 {rubric_text}
----
 
-For each metric, give:
+For each metric, provide:
+- Score (1-5)
+- Reasoning
+- Fix Prompt if score < 4
 
-* **Score (1–5)**
-* **Reasoning**
-* **Fix Prompt if score < 4** (a short instruction that could be used to revise the section toward a perfect score)
-
-
-Format your response as a table with columns: Metric, Score, Reasoning, Fix Prompt."""
+Format as a table: Metric | Score | Reasoning | Fix Prompt"""
     
     logger.debug(f"Prompt constructed, length: {len(prompt)}")
     logger.info("Calling OpenAI API...")
     
     try:
-        # Call OpenAI API
+        # Call OpenAI API with timeout and optimized settings
         start_time = datetime.now()
         response = client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-4o-mini",  # Using faster, cheaper model
             messages=[
-                {"role": "system", "content": "You are an expert RFP evaluator. Provide detailed, structured evaluations with scores, reasoning, and actionable fix suggestions."},
+                {"role": "system", "content": "You are an expert RFP evaluator. Provide concise, structured evaluations."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            max_tokens=2000,  # Limit response length
+            temperature=0.3  # Lower temperature for more consistent results
         )
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -94,6 +116,9 @@ Format your response as a table with columns: Metric, Score, Reasoning, Fix Prom
         logger.debug(f"Response received, length: {len(result)}")
         
         return result
+    except APITimeoutError as e:
+        logger.error(f"OpenAI API timeout: {str(e)}")
+        raise Exception("OpenAI API request timed out. Please try again with shorter text.")
     except Exception as e:
         logger.error(f"Error in OpenAI API call: {str(e)}", exc_info=True)
         raise
@@ -147,12 +172,24 @@ def evaluate():
                 logger.warning(f"Section {i + 1} missing rubric")
                 return jsonify({'error': f'Rubric is required for section {i + 1}'}), 400
         
-        # Process sections sequentially
+        # Process sections sequentially with queue management
         results = []
+        global active_requests
+        
         for i, section in enumerate(sections):
             logger.info(f"Processing section {i + 1} of {len(sections)}")
             rfp_text = section.get('rfp_text', '').strip()
             rubric_text = section.get('rubric', '').strip()
+            
+            # Wait if too many concurrent requests
+            with queue_lock:
+                while active_requests >= max_concurrent_requests:
+                    logger.debug(f"Waiting for available slot. Active: {active_requests}/{max_concurrent_requests}")
+                    queue_lock.release()
+                    time.sleep(0.5)  # Wait 500ms before checking again
+                    queue_lock.acquire()
+                active_requests += 1
+                logger.debug(f"Request slot acquired. Active: {active_requests}/{max_concurrent_requests}")
             
             try:
                 evaluation_result = evaluate_single_section(rfp_text, rubric_text)
@@ -162,6 +199,11 @@ def evaluate():
                     'success': True,
                     'result': evaluation_result
                 })
+            finally:
+                # Always release the slot
+                with queue_lock:
+                    active_requests -= 1
+                    logger.debug(f"Request slot released. Active: {active_requests}/{max_concurrent_requests}")
             except AuthenticationError as e:
                 logger.error(f"Section {i + 1}: Authentication error - {str(e)}")
                 results.append({
@@ -171,6 +213,8 @@ def evaluate():
                 })
             except RateLimitError as e:
                 logger.warning(f"Section {i + 1}: Rate limit error - {str(e)}")
+                # Wait a bit before continuing with next section
+                time.sleep(2)
                 results.append({
                     'section_index': i,
                     'success': False,
