@@ -456,10 +456,16 @@
                         }
 
                         const data = JSON.parse(text);
+                        
+                        // Debug logging
+                        console.log('Evaluation response:', data);
+                        console.log('Section index:', section.section_index);
 
                         if (data.success && data.results && data.results.length > 0) {
+                            console.log('Result data:', data.results[0]);
                             allResults.push(data.results[0]);
                         } else {
+                            console.error('Evaluation failed:', data.error || 'Unknown error');
                             allResults.push({
                                 section_index: section.section_index,
                                 success: false,
@@ -468,6 +474,7 @@
                         }
 
                         // Display result for this section immediately
+                        console.log('Displaying result for section:', section.section_index, allResults[allResults.length - 1]);
                         displaySectionResult(section.section_index, allResults[allResults.length - 1]);
 
                     } catch (error) {
@@ -495,9 +502,13 @@
                 }
 
                 // Show results container
+                console.log('All results:', allResults);
                 if (allResults.length > 0) {
                     results.style.display = 'block';
                     results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                } else {
+                    console.error('No results to display!');
+                    showError('Evaluation completed but no results were generated. Please check the console for details.');
                 }
 
             } catch (error) {
@@ -531,27 +542,39 @@
         }
 
         function displaySectionResult(sectionIndex, result) {
+            console.log('displaySectionResult called with:', sectionIndex, result);
+            console.log('Available sections:', pdfSections.map(s => ({ index: s.index, title: s.title })));
+            
             const sectionResultDiv = document.createElement('div');
             sectionResultDiv.className = 'section-result';
             
-            const section = pdfSections.find(s => s.index === sectionIndex);
+            // Convert both to string for comparison to handle type mismatches
+            const section = pdfSections.find(s => String(s.index) === String(sectionIndex));
             const sectionTitle = section ? section.title : `Section ${sectionIndex}`;
             
             sectionResultDiv.innerHTML = `<h3 class="section-result-header">Section ${sectionIndex}: ${escapeHtml(sectionTitle)}</h3>`;
 
-            if (result.success && result.result) {
+            if (result && result.success && result.result) {
+                console.log('Displaying successful result');
                 const resultContent = document.createElement('div');
                 resultContent.className = 'section-result-content';
                 resultContent.innerHTML = formatResults(result.result);
                 sectionResultDiv.appendChild(resultContent);
             } else {
+                console.log('Displaying error:', result?.error || 'No result data');
                 const errorDiv = document.createElement('div');
                 errorDiv.className = 'section-error';
-                errorDiv.textContent = result.error || 'An error occurred while evaluating this section.';
+                errorDiv.textContent = result?.error || 'An error occurred while evaluating this section.';
                 sectionResultDiv.appendChild(errorDiv);
             }
 
             resultsContent.appendChild(sectionResultDiv);
+            console.log('Result appended to resultsContent');
+            
+            // Ensure results container is visible
+            if (results.style.display === 'none') {
+                results.style.display = 'block';
+            }
         }
 
         function isMarkdownTable(text) {

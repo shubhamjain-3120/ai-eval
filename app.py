@@ -296,7 +296,7 @@ Provide your evaluation NOW in the required markdown table format."""
         start_time = datetime.now()
         openai_client = get_openai_client()
         response = openai_client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": "You are an expert RFP evaluator. You MUST always format your responses as markdown tables with columns: Metric, Score, Reasoning, Fix Prompt. Never provide plain text or other formats - only markdown tables."},
                 {"role": "user", "content": prompt}
