@@ -31,15 +31,21 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Use system temp directory for cross-platform compatibility
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()  # Temporary folder for uploads
 
-# Initialize OpenAI client
-api_key = os.getenv('OPENAI_API_KEY')
-if not api_key:
-    logger.error("OPENAI_API_KEY environment variable is not set")
-    raise ValueError("OPENAI_API_KEY environment variable is not set")
+# Initialize OpenAI client (lazy initialization)
+client = None
 
-logger.info("Initializing OpenAI client")
-client = OpenAI(api_key=api_key)
-logger.info("OpenAI client initialized successfully")
+def get_openai_client():
+    """Get or initialize OpenAI client"""
+    global client
+    if client is None:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            logger.error("OPENAI_API_KEY environment variable is not set")
+            raise ValueError("OPENAI_API_KEY environment variable is not set. Please set it in your environment variables.")
+        logger.info("Initializing OpenAI client")
+        client = OpenAI(api_key=api_key)
+        logger.info("OpenAI client initialized successfully")
+    return client
 
 
 @app.route('/')
@@ -288,7 +294,8 @@ Provide your evaluation NOW in the required markdown table format."""
     try:
         # Call OpenAI API
         start_time = datetime.now()
-        response = client.chat.completions.create(
+        openai_client = get_openai_client()
+        response = openai_client.chat.completions.create(
             model="gpt-5",
             messages=[
                 {"role": "system", "content": "You are an expert RFP evaluator. You MUST always format your responses as markdown tables with columns: Metric, Score, Reasoning, Fix Prompt. Never provide plain text or other formats - only markdown tables."},
