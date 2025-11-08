@@ -1,11 +1,15 @@
 import os
 import logging
 import sys
+import re
+import tempfile
+import pdfplumber
 from flask import Flask, render_template, request, jsonify
 from openai import OpenAI
 from openai import AuthenticationError, RateLimitError, APIError
 from dotenv import load_dotenv
 from datetime import datetime
+from werkzeug.utils import secure_filename
 
 # Load environment variables
 load_dotenv()
@@ -23,6 +27,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+# Use system temp directory for cross-platform compatibility
+app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()  # Temporary folder for uploads
 
 # Initialize OpenAI client
 api_key = os.getenv('OPENAI_API_KEY')
@@ -42,12 +49,177 @@ def index():
     return render_template('index.html')
 
 
-def evaluate_single_section(rfp_text, rubric_text):
-    """Helper function to evaluate a single section"""
-    logger.debug(f"Evaluating section - RFP text length: {len(rfp_text)}, Rubric length: {len(rubric_text)}")
+def extract_sections_from_pdf(pdf_path):
+    """Extract sections from PDF using pdfplumber"""
+    sections = []
+    current_section_title = None
+    current_content = []
+    section_index = 1
     
-    # Construct the prompt
-    prompt = f"""Evaluate the following RFP response section using the rubric below.
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    full_text += page_text + "\n"
+        
+        # Split text into lines for analysis
+        lines = full_text.split('\n')
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            if not line:
+                i += 1
+                continue
+            
+            # Only treat ALL CAPS lines as section headings
+            # Requirements:
+            # 1. Must be all uppercase
+            # 2. Must have at least 5 characters (to avoid false positives)
+            # 3. Must contain letters (not just numbers/symbols)
+            # 4. Ignore mixed-case headings (they are sub-sections, not main sections)
+            is_heading = False
+            
+            if (line.isupper() and 
+                len(line) >= 5 and 
+                any(c.isalpha() for c in line) and 
+                not line.isdigit()):
+                # This is an ALL CAPS line - treat it as a section heading
+                # All all-caps lines are sections, regardless of what follows
+                is_heading = True
+            
+            # If it's a heading and we have a previous section, save it
+            if is_heading and current_section_title is not None:
+                content = '\n'.join(current_content).strip()
+                if content:  # Only add if there's content
+                    sections.append({
+                        'index': str(section_index - 1),
+                        'title': current_section_title,
+                        'content': content
+                    })
+                current_content = []
+            
+            if is_heading:
+                # Start new section
+                current_section_title = line
+                section_index += 1
+            elif current_section_title is not None:
+                # Add to current section content
+                current_content.append(line)
+            
+            i += 1
+        
+        # Add the last section
+        if current_section_title is not None:
+            content = '\n'.join(current_content).strip()
+            if content:
+                sections.append({
+                    'index': str(section_index - 1),
+                    'title': current_section_title,
+                    'content': content
+                })
+        
+        # If no sections were found, treat entire document as one section
+        if not sections:
+            sections.append({
+                'index': '1',
+                'title': 'Document',
+                'content': full_text.strip()
+            })
+        
+        # Re-index sections starting from 1
+        for idx, section in enumerate(sections, 1):
+            section['index'] = str(idx)
+        
+        return sections
+    
+    except Exception as e:
+        logger.error(f"Error extracting sections from PDF: {str(e)}", exc_info=True)
+        raise
+
+
+@app.route('/parse-pdf', methods=['POST'])
+def parse_pdf():
+    """Parse uploaded PDF and extract sections"""
+    logger.info("Parse PDF endpoint called")
+    
+    try:
+        if 'file' not in request.files:
+            logger.warning("No file in request")
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            logger.warning("Empty filename")
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Validate file type
+        if not file.filename.lower().endswith('.pdf'):
+            logger.warning(f"Invalid file type: {file.filename}")
+            return jsonify({'error': 'File must be a PDF'}), 400
+        
+        # Save uploaded file temporarily
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        logger.info(f"PDF saved to {filepath}, extracting sections...")
+        
+        # Extract sections
+        sections = extract_sections_from_pdf(filepath)
+        
+        # Clean up temporary file
+        try:
+            os.remove(filepath)
+        except Exception as e:
+            logger.warning(f"Could not remove temporary file {filepath}: {str(e)}")
+        
+        logger.info(f"Extracted {len(sections)} sections from PDF")
+        
+        return jsonify({
+            'success': True,
+            'sections': sections
+        })
+    
+    except Exception as e:
+        logger.error(f"Error parsing PDF: {str(e)}", exc_info=True)
+        return jsonify({
+            'error': f'Error parsing PDF: {str(e)}'
+        }), 500
+
+
+def is_markdown_table(text):
+    """Check if the response contains a markdown table format"""
+    if not text:
+        return False
+    
+    lines = text.split('\n')
+    table_row_count = 0
+    
+    for line in lines:
+        stripped = line.strip()
+        # Check if line is a markdown table row (starts and ends with |)
+        if stripped.startswith('|') and stripped.endswith('|') and len(stripped) > 2:
+            table_row_count += 1
+        # Check if line is a table separator (contains dashes/colons between pipes)
+        elif stripped.startswith('|') and stripped.endswith('|') and ('-' in stripped or ':' in stripped):
+            table_row_count += 1
+    
+    # Require at least 2 table rows (header + at least one data row or separator)
+    return table_row_count >= 2
+
+
+def evaluate_single_section(rfp_text, rubric_text, retry_count=0):
+    """Helper function to evaluate a single section"""
+    logger.debug(f"Evaluating section - RFP text length: {len(rfp_text)}, Rubric length: {len(rubric_text)}, retry: {retry_count}")
+    
+    # Construct the prompt with explicit markdown table format example
+    if retry_count == 0:
+        prompt = f"""Evaluate the following RFP response section using the rubric below.
 
 ---
 
@@ -68,8 +240,47 @@ For each metric, give:
 * **Reasoning**
 * **Fix Prompt if score < 4** (a short instruction that could be used to revise the section toward a perfect score)
 
+**CRITICAL: You MUST format your response as a markdown table with exactly these columns: Metric, Score, Reasoning, Fix Prompt.**
 
-Format your response as a table with columns: Metric, Score, Reasoning, Fix Prompt."""
+Example format:
+| Metric | Score | Reasoning | Fix Prompt |
+|--------|-------|-----------|------------|
+| Challenge Definition & Measurable Outcomes | 2 | No buyer-specific challenge is stated... | Open with a buyer-specific problem statement... |
+| Structure & Organization | 3 | The flow is logical, but... | Add clear subheadings... |
+
+Your response must start with a table header row using pipes (|) and contain at least one data row. Do not include any text before or after the table."""
+    else:
+        # Stronger prompt for retry
+        prompt = f"""You previously provided an evaluation, but it was not in the required markdown table format. 
+
+**RFP Response Section:**
+
+```
+{rfp_text}
+```
+
+**Rubric:**
+
+{rubric_text}
+---
+
+**REQUIRED FORMAT - You MUST use this exact markdown table structure:**
+
+| Metric | Score | Reasoning | Fix Prompt |
+|--------|-------|-----------|------------|
+| [Metric name] | [1-5] | [Your reasoning] | [Fix prompt if score < 4] |
+| [Next metric] | [1-5] | [Your reasoning] | [Fix prompt if score < 4] |
+
+**IMPORTANT:**
+- Start immediately with the table header row (| Metric | Score | Reasoning | Fix Prompt |)
+- Include a separator row (|--------|-------|-----------|------------|)
+- Each metric must be on its own row
+- Use pipes (|) to separate columns
+- Do NOT include any text before the table
+- Do NOT include any text after the table
+- Ensure every row starts and ends with a pipe character (|)
+
+Provide your evaluation NOW in the required markdown table format."""
     
     logger.debug(f"Prompt constructed, length: {len(prompt)}")
     logger.info("Calling OpenAI API...")
@@ -80,7 +291,7 @@ Format your response as a table with columns: Metric, Score, Reasoning, Fix Prom
         response = client.chat.completions.create(
             model="gpt-5",
             messages=[
-                {"role": "system", "content": "You are an expert RFP evaluator. Provide detailed, structured evaluations with scores, reasoning, and actionable fix suggestions."},
+                {"role": "system", "content": "You are an expert RFP evaluator. You MUST always format your responses as markdown tables with columns: Metric, Score, Reasoning, Fix Prompt. Never provide plain text or other formats - only markdown tables."},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -92,6 +303,21 @@ Format your response as a table with columns: Metric, Score, Reasoning, Fix Prom
         # Extract the response text
         result = response.choices[0].message.content
         logger.debug(f"Response received, length: {len(result)}")
+        
+        # Validate table format
+        if not is_markdown_table(result):
+            logger.warning("Response is not in markdown table format")
+            if retry_count < 1:  # Retry once with stronger prompt
+                logger.info("Retrying with stronger table format requirement")
+                return evaluate_single_section(rfp_text, rubric_text, retry_count + 1)
+            else:
+                logger.warning("Retry limit reached, returning response as-is")
+                # Try to extract table from response if it exists but wasn't detected
+                lines = result.split('\n')
+                table_lines = [line for line in lines if line.strip().startswith('|') and line.strip().endswith('|')]
+                if len(table_lines) >= 2:
+                    # Found some table rows, return just those
+                    return '\n'.join(table_lines)
         
         return result
     except Exception as e:
@@ -157,53 +383,59 @@ def evaluate():
             try:
                 evaluation_result = evaluate_single_section(rfp_text, rubric_text)
                 logger.info(f"Section {i + 1} evaluated successfully")
+                # Include section index from request if provided
+                section_idx = section.get('section_index', i)
                 results.append({
-                    'section_index': i,
+                    'section_index': section_idx,
                     'success': True,
                     'result': evaluation_result
                 })
             except AuthenticationError as e:
                 logger.error(f"Section {i + 1}: Authentication error - {str(e)}")
+                section_idx = section.get('section_index', i)
                 results.append({
-                    'section_index': i,
+                    'section_index': section_idx,
                     'success': False,
                     'error': 'OpenAI API authentication failed. Please check that your OPENAI_API_KEY environment variable is correct and valid. Make sure there are no extra spaces or quotes around the key.'
                 })
             except RateLimitError as e:
                 logger.warning(f"Section {i + 1}: Rate limit error - {str(e)}")
+                section_idx = section.get('section_index', i)
                 results.append({
-                    'section_index': i,
+                    'section_index': section_idx,
                     'success': False,
                     'error': 'OpenAI API rate limit exceeded. Please try again in a moment.'
                 })
             except APIError as api_error:
                 error_msg = str(api_error)
                 logger.error(f"Section {i + 1}: API error - {error_msg}")
+                section_idx = section.get('section_index', i)
                 if "insufficient_quota" in error_msg.lower() or "quota" in error_msg.lower():
                     results.append({
-                        'section_index': i,
+                        'section_index': section_idx,
                         'success': False,
                         'error': 'OpenAI API quota exceeded. Please check your OpenAI account billing and usage limits.'
                     })
                 else:
                     results.append({
-                        'section_index': i,
+                        'section_index': section_idx,
                         'success': False,
                         'error': f'OpenAI API error: {error_msg}'
                     })
             except Exception as api_error:
                 error_msg = str(api_error)
                 logger.error(f"Section {i + 1}: Unexpected error - {error_msg}", exc_info=True)
+                section_idx = section.get('section_index', i)
                 # Fallback for other error types
                 if "401" in error_msg or "authentication" in error_msg.lower() or "invalid_api_key" in error_msg.lower() or "access denied" in error_msg.lower():
                     results.append({
-                        'section_index': i,
+                        'section_index': section_idx,
                         'success': False,
                         'error': 'OpenAI API authentication failed. Please check that your OPENAI_API_KEY environment variable is correct and valid. Make sure there are no extra spaces or quotes around the key.'
                     })
                 else:
                     results.append({
-                        'section_index': i,
+                        'section_index': section_idx,
                         'success': False,
                         'error': f'OpenAI API error: {error_msg}'
                     })

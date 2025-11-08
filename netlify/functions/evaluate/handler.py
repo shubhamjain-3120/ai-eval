@@ -11,10 +11,32 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 
-def evaluate_single_section(rfp_text, rubric_text):
+def is_markdown_table(text):
+    """Check if the response contains a markdown table format"""
+    if not text:
+        return False
+    
+    lines = text.split('\n')
+    table_row_count = 0
+    
+    for line in lines:
+        stripped = line.strip()
+        # Check if line is a markdown table row (starts and ends with |)
+        if stripped.startswith('|') and stripped.endswith('|') and len(stripped) > 2:
+            table_row_count += 1
+        # Check if line is a table separator (contains dashes/colons between pipes)
+        elif stripped.startswith('|') and stripped.endswith('|') and ('-' in stripped or ':' in stripped):
+            table_row_count += 1
+    
+    # Require at least 2 table rows (header + at least one data row or separator)
+    return table_row_count >= 2
+
+
+def evaluate_single_section(rfp_text, rubric_text, retry_count=0):
     """Helper function to evaluate a single section"""
-    # Construct the prompt
-    prompt = f"""Evaluate the following RFP response section using the rubric below.
+    # Construct the prompt with explicit markdown table format example
+    if retry_count == 0:
+        prompt = f"""Evaluate the following RFP response section using the rubric below.
 
 ---
 
@@ -35,20 +57,73 @@ For each metric, give:
 * **Reasoning**
 * **Fix Prompt if score < 4** (a short instruction that could be used to revise the section toward a perfect score)
 
+**CRITICAL: You MUST format your response as a markdown table with exactly these columns: Metric, Score, Reasoning, Fix Prompt.**
 
-Format your response as a table with columns: Metric, Score, Reasoning, Fix Prompt."""
+Example format:
+| Metric | Score | Reasoning | Fix Prompt |
+|--------|-------|-----------|------------|
+| Challenge Definition & Measurable Outcomes | 2 | No buyer-specific challenge is stated... | Open with a buyer-specific problem statement... |
+| Structure & Organization | 3 | The flow is logical, but... | Add clear subheadings... |
+
+Your response must start with a table header row using pipes (|) and contain at least one data row. Do not include any text before or after the table."""
+    else:
+        # Stronger prompt for retry
+        prompt = f"""You previously provided an evaluation, but it was not in the required markdown table format. 
+
+**RFP Response Section:**
+
+```
+{rfp_text}
+```
+
+**Rubric:**
+
+{rubric_text}
+---
+
+**REQUIRED FORMAT - You MUST use this exact markdown table structure:**
+
+| Metric | Score | Reasoning | Fix Prompt |
+|--------|-------|-----------|------------|
+| [Metric name] | [1-5] | [Your reasoning] | [Fix prompt if score < 4] |
+| [Next metric] | [1-5] | [Your reasoning] | [Fix prompt if score < 4] |
+
+**IMPORTANT:**
+- Start immediately with the table header row (| Metric | Score | Reasoning | Fix Prompt |)
+- Include a separator row (|--------|-------|-----------|------------|)
+- Each metric must be on its own row
+- Use pipes (|) to separate columns
+- Do NOT include any text before the table
+- Do NOT include any text after the table
+- Ensure every row starts and ends with a pipe character (|)
+
+Provide your evaluation NOW in the required markdown table format."""
     
     # Call OpenAI API
     response = client.chat.completions.create(
         model="gpt-5",
         messages=[
-            {"role": "system", "content": "You are an expert RFP evaluator. Provide detailed, structured evaluations with scores, reasoning, and actionable fix suggestions."},
+            {"role": "system", "content": "You are an expert RFP evaluator. You MUST always format your responses as markdown tables with columns: Metric, Score, Reasoning, Fix Prompt. Never provide plain text or other formats - only markdown tables."},
             {"role": "user", "content": prompt}
         ]
     )
     
     # Extract the response text
-    return response.choices[0].message.content
+    result = response.choices[0].message.content
+    
+    # Validate table format
+    if not is_markdown_table(result):
+        if retry_count < 1:  # Retry once with stronger prompt
+            return evaluate_single_section(rfp_text, rubric_text, retry_count + 1)
+        else:
+            # Try to extract table from response if it exists but wasn't detected
+            lines = result.split('\n')
+            table_lines = [line for line in lines if line.strip().startswith('|') and line.strip().endswith('|')]
+            if len(table_lines) >= 2:
+                # Found some table rows, return just those
+                return '\n'.join(table_lines)
+    
+    return result
 
 
 def handler(event, context):
