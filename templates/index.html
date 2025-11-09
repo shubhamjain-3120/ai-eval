@@ -39,12 +39,35 @@
                 <div class="phase-header-with-action">
                     <div>
                         <h2>Step 2: Map Rubrics to Sections</h2>
-                        <p class="phase-description">Review the extracted sections and add rubrics for each section. Sections without rubrics will be marked with a warning.</p>
+                        <p class="phase-description">Review the extracted sections and add rubrics for each section. You can upload a rubric PDF to auto-map sections, or enter rubrics manually. Sections without rubrics will be marked with a warning.</p>
                     </div>
                     <button type="button" id="startOverBtn" class="start-over-btn" onclick="startOver()">
                         <span>🔄</span> Upload New PDF
                     </button>
                 </div>
+                
+                <!-- Rubric PDF Upload Section -->
+                <div id="rubricUploadSection" class="rubric-upload-section">
+                    <h3>Upload Rubric PDF (Optional)</h3>
+                    <p class="rubric-upload-description">Upload a rubric PDF to automatically map rubric sections to your PDF sections based on matching section names.</p>
+                    <div class="rubric-upload-controls">
+                        <input type="file" id="rubricPdfInput" accept=".pdf" style="display: none;">
+                        <label for="rubricPdfInput" class="file-upload-label rubric-upload-label">
+                            <span class="upload-icon">📋</span>
+                            <span class="upload-text">Choose Rubric PDF</span>
+                        </label>
+                        <span id="rubricFileName" class="file-name"></span>
+                        <button type="button" id="mapRubricBtn" class="upload-btn" disabled>
+                            Map Rubrics
+                        </button>
+                    </div>
+                    <div id="rubricUploadLoading" class="loading-message" style="display: none;">
+                        <span class="spinner"></span>
+                        <span>Parsing rubric PDF and matching sections...</span>
+                    </div>
+                    <div id="rubricMappingStatus" class="rubric-mapping-status" style="display: none;"></div>
+                </div>
+                
                 <div id="mappingContainer" class="mapping-container">
                     <!-- Sections with rubrics will be displayed here -->
                 </div>
@@ -71,7 +94,12 @@
 
             <!-- Phase 4: Results -->
             <div id="results" class="results" style="display: none;">
-                <h2>Evaluation Results</h2>
+                <div class="results-header">
+                    <h2>Evaluation Results</h2>
+                    <button type="button" id="exportPdfBtn" class="export-pdf-btn">
+                        <span>📄</span> Export PDF Report
+                    </button>
+                </div>
                 <div id="resultsContent" class="results-content"></div>
             </div>
         </main>
@@ -95,12 +123,19 @@
         const results = document.getElementById('results');
         const resultsContent = document.getElementById('resultsContent');
         const errorMessage = document.getElementById('errorMessage');
+        const exportPdfBtn = document.getElementById('exportPdfBtn');
+        const rubricPdfInput = document.getElementById('rubricPdfInput');
+        const rubricFileName = document.getElementById('rubricFileName');
+        const mapRubricBtn = document.getElementById('mapRubricBtn');
+        const rubricUploadLoading = document.getElementById('rubricUploadLoading');
+        const rubricMappingStatus = document.getElementById('rubricMappingStatus');
 
         // State
         let pdfSections = [];
         let isEvaluating = false;
         let shouldStop = false;
         let currentControllers = [];
+        let allEvaluationResults = []; // Store all evaluation results for PDF export
 
         // Load saved data from localStorage
         function loadFromLocalStorage() {
@@ -150,6 +185,109 @@
             } else {
                 fileName.textContent = '';
                 uploadBtn.disabled = true;
+            }
+        });
+
+        // Rubric PDF file input handler
+        rubricPdfInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                rubricFileName.textContent = file.name;
+                mapRubricBtn.disabled = false;
+            } else {
+                rubricFileName.textContent = '';
+                mapRubricBtn.disabled = true;
+            }
+        });
+
+        // Map rubric button handler
+        mapRubricBtn.addEventListener('click', async () => {
+            const file = rubricPdfInput.files[0];
+            if (!file) {
+                showError('Please select a rubric PDF file');
+                return;
+            }
+
+            if (pdfSections.length === 0) {
+                showError('Please upload and parse the main PDF first');
+                return;
+            }
+
+            mapRubricBtn.disabled = true;
+            rubricUploadLoading.style.display = 'flex';
+            rubricMappingStatus.style.display = 'none';
+            errorMessage.style.display = 'none';
+
+            const formData = new FormData();
+            formData.append('rubric_file', file);
+            formData.append('pdf_sections', JSON.stringify(pdfSections));
+
+            try {
+                const response = await fetch('/map-rubric-pdf', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to map rubric PDF');
+                }
+
+                if (data.success && data.matches) {
+                    const matches = data.matches;
+                    const matchedCount = Object.keys(matches).length;
+                    
+                    // Auto-populate rubrics
+                    const rubrics = JSON.parse(localStorage.getItem('rubrics') || '{}');
+                    let populatedCount = 0;
+                    
+                    Object.keys(matches).forEach(sectionIndex => {
+                        const match = matches[sectionIndex];
+                        const rubricContent = match.rubric_content;
+                        if (rubricContent && rubricContent.trim()) {
+                            rubrics[sectionIndex] = rubricContent.trim();
+                            populatedCount++;
+                            
+                            // Update textarea if it exists
+                            const textarea = document.getElementById(`rubric_${sectionIndex}`);
+                            if (textarea) {
+                                textarea.value = rubricContent.trim();
+                            }
+                        }
+                    });
+                    
+                    localStorage.setItem('rubrics', JSON.stringify(rubrics));
+                    
+                    // Update warning icons
+                    pdfSections.forEach(section => {
+                        const rubric = rubrics[section.index];
+                        if (rubric) {
+                            updateWarningIcon(section.index, rubric);
+                        }
+                    });
+                    
+                    // Show status message
+                    rubricMappingStatus.style.display = 'block';
+                    rubricMappingStatus.className = 'rubric-mapping-status success';
+                    rubricMappingStatus.innerHTML = `
+                        <strong>✓ Successfully mapped ${populatedCount} of ${matchedCount} matched sections</strong>
+                        ${matchedCount < pdfSections.length ? `<br><small>${pdfSections.length - matchedCount} sections could not be automatically matched. Please add rubrics manually.</small>` : ''}
+                    `;
+                    
+                    // Re-render to update all sections
+                    displayMappingInterface();
+                } else {
+                    throw new Error('No matches found in rubric PDF');
+                }
+            } catch (error) {
+                showError(error.message || 'Error mapping rubric PDF. Please try again.');
+                rubricMappingStatus.style.display = 'block';
+                rubricMappingStatus.className = 'rubric-mapping-status error';
+                rubricMappingStatus.innerHTML = `<strong>Error:</strong> ${error.message || 'Failed to map rubric PDF'}`;
+            } finally {
+                rubricUploadLoading.style.display = 'none';
+                mapRubricBtn.disabled = false;
             }
         });
 
@@ -214,28 +352,51 @@
                             <div class="section-number-badge">Section ${section.index}</div>
                             <h3 class="section-title-main">${escapeHtml(section.title)}</h3>
                         </div>
-                        ${!hasRubric ? '<span class="warning-badge" title="No rubric mapped"><span class="warning-icon">⚠️</span> Rubric Required</span>' : '<span class="success-badge"><span class="check-icon">✓</span> Rubric Added</span>'}
+                        <div class="section-header-actions">
+                            ${!hasRubric ? '<span class="warning-badge" title="No rubric mapped"><span class="warning-icon">⚠️</span> Rubric Required</span>' : '<span class="success-badge"><span class="check-icon">✓</span> Rubric Added</span>'}
+                            <button type="button" class="edit-section-btn" onclick="editSectionContent(${section.index})" title="Edit section content">
+                                <span>✏️</span> Edit
+                            </button>
+                            <button type="button" class="delete-section-btn" onclick="deleteSection(${section.index})" title="Delete this section">
+                                <span>🗑️</span> Delete
+                            </button>
+                        </div>
                     </div>
                     <div class="section-content-full">
                         <div class="section-content-header">
                             <strong>Section Content</strong>
-                            ${section.content.length > 200 ? `<button type="button" class="toggle-content-btn" onclick="toggleContent(${section.index})" id="toggle-btn-${section.index}">
-                                <span class="toggle-icon" id="toggle-icon-${section.index}">▶</span> 
-                                <span class="toggle-text" id="toggle-text-${section.index}">Show More</span>
-                            </button>` : ''}
+                            <div class="content-actions">
+                                ${section.content.length > 200 ? `<button type="button" class="toggle-content-btn" onclick="toggleContent(${section.index})" id="toggle-btn-${section.index}">
+                                    <span class="toggle-icon" id="toggle-icon-${section.index}">▶</span> 
+                                    <span class="toggle-text" id="toggle-text-${section.index}">Show More</span>
+                                </button>` : ''}
+                            </div>
                         </div>
-                        ${section.content.length > 200 ? `
-                        <div class="section-content-preview" id="preview-${section.index}">
-                            <p>${escapeHtml(section.content.substring(0, 200))}...</p>
+                        <div id="content-display-${section.index}">
+                            ${section.content.length > 200 ? `
+                            <div class="section-content-preview" id="preview-${section.index}">
+                                <p>${escapeHtml(section.content.substring(0, 200))}...</p>
+                            </div>
+                            <div class="section-content-text collapsed" id="content-${section.index}">
+                                <pre>${escapeHtml(section.content)}</pre>
+                            </div>
+                            ` : `
+                            <div class="section-content-text" id="content-${section.index}" style="max-height: none;">
+                                <pre>${escapeHtml(section.content)}</pre>
+                            </div>
+                            `}
                         </div>
-                        <div class="section-content-text collapsed" id="content-${section.index}">
-                            <pre>${escapeHtml(section.content)}</pre>
+                        <div id="content-edit-${section.index}" style="display: none;">
+                            <textarea 
+                                id="edit-content-${section.index}" 
+                                class="section-content-edit"
+                                rows="12"
+                            >${escapeHtml(section.content)}</textarea>
+                            <div class="edit-actions">
+                                <button type="button" class="save-edit-btn" onclick="saveSectionContent(${section.index})">Save</button>
+                                <button type="button" class="cancel-edit-btn" onclick="cancelEditSection(${section.index})">Cancel</button>
+                            </div>
                         </div>
-                        ` : `
-                        <div class="section-content-text" id="content-${section.index}" style="max-height: none;">
-                            <pre>${escapeHtml(section.content)}</pre>
-                        </div>
-                        `}
                     </div>
                     <div class="rubric-input-group">
                         <label for="rubric_${section.index}">
@@ -334,6 +495,21 @@
             fileName.textContent = '';
             uploadBtn.disabled = true;
             
+            // Clear rubric file input
+            if (rubricPdfInput) {
+                rubricPdfInput.value = '';
+            }
+            if (rubricFileName) {
+                rubricFileName.textContent = '';
+            }
+            if (mapRubricBtn) {
+                mapRubricBtn.disabled = true;
+            }
+            if (rubricMappingStatus) {
+                rubricMappingStatus.style.display = 'none';
+                rubricMappingStatus.innerHTML = '';
+            }
+            
             // Hide phases
             mappingPhase.style.display = 'none';
             evaluationPhase.style.display = 'none';
@@ -394,6 +570,7 @@
 
             // Clear previous results
             resultsContent.innerHTML = '';
+            allEvaluationResults = []; // Reset for new evaluation
 
             // Process sections sequentially
             const allResults = [];
@@ -476,6 +653,9 @@
                         // Display result for this section immediately
                         console.log('Displaying result for section:', section.section_index, allResults[allResults.length - 1]);
                         displaySectionResult(section.section_index, allResults[allResults.length - 1]);
+                        
+                        // Store result for PDF export
+                        allEvaluationResults.push(allResults[allResults.length - 1]);
 
                     } catch (error) {
                         clearTimeout(timeoutId);
@@ -498,12 +678,17 @@
                         }
 
                         displaySectionResult(section.section_index, allResults[allResults.length - 1]);
+                        
+                        // Store result for PDF export
+                        allEvaluationResults.push(allResults[allResults.length - 1]);
                     }
                 }
 
                 // Show results container
                 console.log('All results:', allResults);
                 if (allResults.length > 0) {
+                    // Store all results for PDF export
+                    allEvaluationResults = allResults;
                     results.style.display = 'block';
                     results.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 } else {
@@ -783,6 +968,161 @@
                 if (toggleText) toggleText.textContent = 'Show More';
             }
         };
+
+        // Delete section
+        window.deleteSection = function(sectionIndex) {
+            if (!confirm(`Are you sure you want to delete Section ${sectionIndex}? This action cannot be undone.`)) {
+                return;
+            }
+            
+            // Remove from pdfSections array
+            pdfSections = pdfSections.filter(s => String(s.index) !== String(sectionIndex));
+            
+            // Remove rubric from localStorage
+            const rubrics = JSON.parse(localStorage.getItem('rubrics') || '{}');
+            delete rubrics[sectionIndex];
+            
+            // Renumber remaining sections
+            pdfSections.forEach((section, idx) => {
+                const oldIndex = section.index;
+                section.index = String(idx + 1);
+                
+                // Update rubric mapping if it exists
+                if (rubrics[oldIndex]) {
+                    rubrics[section.index] = rubrics[oldIndex];
+                    delete rubrics[oldIndex];
+                }
+            });
+            
+            localStorage.setItem('rubrics', JSON.stringify(rubrics));
+            
+            // Update localStorage
+            saveToLocalStorage();
+            
+            // Re-render the mapping interface
+            displayMappingInterface();
+        };
+
+        // Edit section content
+        window.editSectionContent = function(sectionIndex) {
+            const displayDiv = document.getElementById(`content-display-${sectionIndex}`);
+            const editDiv = document.getElementById(`content-edit-${sectionIndex}`);
+            
+            if (displayDiv && editDiv) {
+                displayDiv.style.display = 'none';
+                editDiv.style.display = 'block';
+            }
+        };
+
+        // Save section content
+        window.saveSectionContent = function(sectionIndex) {
+            const editTextarea = document.getElementById(`edit-content-${sectionIndex}`);
+            const displayDiv = document.getElementById(`content-display-${sectionIndex}`);
+            const editDiv = document.getElementById(`content-edit-${sectionIndex}`);
+            
+            if (!editTextarea) return;
+            
+            const newContent = editTextarea.value.trim();
+            
+            if (!newContent) {
+                alert('Section content cannot be empty.');
+                return;
+            }
+            
+            // Update the section in pdfSections array
+            const section = pdfSections.find(s => String(s.index) === String(sectionIndex));
+            if (section) {
+                section.content = newContent;
+                saveToLocalStorage();
+            }
+            
+            // Hide edit, show display
+            if (editDiv) editDiv.style.display = 'none';
+            if (displayDiv) displayDiv.style.display = 'block';
+            
+            // Re-render the section to update the preview and content
+            displayMappingInterface();
+        };
+
+        // Cancel edit section content
+        window.cancelEditSection = function(sectionIndex) {
+            const displayDiv = document.getElementById(`content-display-${sectionIndex}`);
+            const editDiv = document.getElementById(`content-edit-${sectionIndex}`);
+            const editTextarea = document.getElementById(`edit-content-${sectionIndex}`);
+            
+            // Reset textarea to original content
+            const section = pdfSections.find(s => String(s.index) === String(sectionIndex));
+            if (editTextarea && section) {
+                editTextarea.value = section.content;
+            }
+            
+            // Hide edit, show display
+            if (editDiv) editDiv.style.display = 'none';
+            if (displayDiv) displayDiv.style.display = 'block';
+        };
+
+        // Export PDF button handler
+        exportPdfBtn.addEventListener('click', async () => {
+            if (allEvaluationResults.length === 0) {
+                showError('No evaluation results available to export. Please run an evaluation first.');
+                return;
+            }
+
+            if (pdfSections.length === 0) {
+                showError('No sections available to export.');
+                return;
+            }
+
+            // Disable button during export
+            exportPdfBtn.disabled = true;
+            const originalText = exportPdfBtn.innerHTML;
+            exportPdfBtn.innerHTML = '<span class="spinner"></span> Generating PDF...';
+
+            try {
+                // Collect sections with rubrics
+                const rubrics = JSON.parse(localStorage.getItem('rubrics') || '{}');
+                const sectionsForExport = pdfSections.map(section => ({
+                    index: section.index,
+                    title: section.title,
+                    content: section.content,
+                    rubric: rubrics[section.index] || ''
+                }));
+
+                // Send to backend
+                const response = await fetch('/export-pdf', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        sections: sectionsForExport,
+                        results: allEvaluationResults
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || 'Failed to generate PDF');
+                }
+
+                // Download the PDF
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `RFP_Evaluation_Report_${new Date().toISOString().slice(0, 10)}.pdf`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+
+            } catch (error) {
+                showError(error.message || 'Error generating PDF. Please try again.');
+            } finally {
+                exportPdfBtn.disabled = false;
+                exportPdfBtn.innerHTML = originalText;
+            }
+        });
 
         // Load saved data on page load
         loadFromLocalStorage();
